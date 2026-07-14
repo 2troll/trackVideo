@@ -39,7 +39,7 @@ USER_AGENT = "trackVideo/1.0 (hobby project; https://github.com/)"
 NOMINATIM = "https://nominatim.openstreetmap.org/search"
 
 # pesos por tipo de pista al decidir la zona dominante
-WEIGHTS = {"matricula": 3.0, "telefono": 3.0, "postal": 4.0, "lugar": 1.0}
+WEIGHTS = {"matricula": 3.0, "telefono": 3.0, "postal": 4.0, "titulo": 2.5, "lugar": 1.0}
 
 
 def die(msg: str) -> None:
@@ -202,22 +202,36 @@ def find_signals(text_lines: list[str]) -> list[dict]:
     return signals
 
 
+# basura típica del OCR: kanji numéricos, rayas, símbolos repetidos
+GARBAGE_RE = re.compile(r"^[一二三四五六七八九十〇口日目王三=|｜ー・、。]+$")
+
+
 def candidate_places(text_lines: list[str]) -> list[str]:
     """Extrae textos que parecen nombres de sitios, para geocodificar."""
     cands = []
     for line in text_lines:
-        line = line.strip("・.,:;|/*-—〜~ 　")
-        if not (2 <= len(line) <= 20):
+        line = line.strip("・.,:;|/*-—〜~=＝ 　")
+        if not (3 <= len(line) <= 20):
             continue
         if not KANJI_KANA.search(line):
             continue
         if line in STOPWORDS or line in PLATE_REGIONS:
             continue
-        # prioridad a lo que acaba en 駅/通り/神社... o tiene ≥2 kanji
-        kanji = len(re.findall(r"[一-鿿]", line))
-        if PLACE_SUFFIX.search(line) or kanji >= 2:
+        if PHONE_RE.search(line) or POSTAL_RE.search(line):
+            continue  # ya se trató como señal directa
+        if GARBAGE_RE.match(line) or len(set(line)) <= 2:
+            continue
+        # solo lo que de verdad parece un topónimo: sufijo típico o ≥3 kanji distintos
+        kanji_distintos = len(set(re.findall(r"[一-鿿]", line)))
+        if PLACE_SUFFIX.search(line) or kanji_distintos >= 3:
             cands.append(line)
     return cands
+
+
+def title_places(meta: dict) -> list[str]:
+    """Saca posibles topónimos del título del vídeo (los canales suelen ponerlo)."""
+    runs = re.findall(r"[぀-ヿ一-鿿]{3,}", meta.get("title", ""))
+    return [r for r in runs if not GARBAGE_RE.match(r)][:5]
 
 
 # ---------------------------------------------------------------- geocoding
@@ -225,7 +239,7 @@ def candidate_places(text_lines: list[str]) -> list[str]:
 def nominatim(query: str, extra: dict | None = None) -> dict | None:
     """Consulta Nominatim (OSM, gratis). Respeta 1 petición/segundo."""
     params = {"format": "jsonv2", "limit": "1", "countrycodes": "jp",
-              "accept-language": "es"}
+              "accept-language": "ja"}  # en japonés para poder verificar la coincidencia
     if extra:
         params.update(extra)
     else:
@@ -248,8 +262,9 @@ def nominatim(query: str, extra: dict | None = None) -> dict | None:
             "importance": float(hit.get("importance") or 0)}
 
 
-def geocode_signals(per_frame: list[dict], max_queries: int) -> list[dict]:
-    """Geocodifica postales y nombres candidatos. Devuelve lista de evidencias."""
+def geocode_signals(per_frame: list[dict], title_cands: list[str],
+                    max_queries: int) -> list[dict]:
+    """Geocodifica postales, título y nombres candidatos. Devuelve evidencias."""
     evidence = []
     queries_done = 0
 
@@ -264,7 +279,20 @@ def geocode_signals(per_frame: list[dict], max_queries: int) -> list[dict]:
             if sig["lat"] is not None:
                 evidence.append({**sig, "t": fr["t"], "frame": fr["frame"]})
 
-    # 2) nombres de sitios: geocodificar los más repetidos primero
+    # 2) topónimos del título del vídeo (muy a menudo dicen el sitio exacto)
+    for cand in title_cands:
+        if queries_done >= max_queries:
+            break
+        hit = nominatim(cand)
+        queries_done += 1
+        if hit and cand in hit["display"]:
+            evidence.append({"type": "titulo", "match": cand, "zone": hit["display"],
+                             "lat": hit["lat"], "lon": hit["lon"], "text": cand,
+                             "t": 0.0, "frame": "titulo"})
+
+    # 3) nombres de sitios leídos por OCR: los más repetidos primero.
+    #    Solo se acepta el resultado si el nombre de OSM CONTIENE el texto leído
+    #    (sin esto, Nominatim "encuentra" cualquier basura de OCR en algún pueblo).
     counter: Counter = Counter()
     first_seen: dict[str, dict] = {}
     for fr in per_frame:
@@ -277,7 +305,7 @@ def geocode_signals(per_frame: list[dict], max_queries: int) -> list[dict]:
             break
         hit = nominatim(cand)
         queries_done += 1
-        if hit and hit["importance"] > 0.05:
+        if hit and cand in hit["display"]:
             fr = first_seen[cand]
             evidence.append({"type": "lugar", "match": cand, "zone": hit["display"],
                              "lat": hit["lat"], "lon": hit["lon"], "text": cand,
@@ -301,6 +329,9 @@ def dominant_area(evidence: list[dict]) -> dict | None:
             best, best_score = p, score
     near = [q for q in pts
             if (best["lat"] - q["lat"]) ** 2 + ((best["lon"] - q["lon"]) * 0.82) ** 2 < 0.55 ** 2]
+    # una sola pista débil no basta para afirmar una zona
+    if len(near) < 2 and WEIGHTS.get(best["type"], 1) < 2:
+        return None
     lat = sum(q["lat"] * WEIGHTS.get(q["type"], 1) for q in near) / \
         sum(WEIGHTS.get(q["type"], 1) for q in near)
     lon = sum(q["lon"] * WEIGHTS.get(q["type"], 1) for q in near) / \
@@ -336,12 +367,14 @@ MAP_TEMPLATE = """<!DOCTYPE html>
 <span class="dot" style="background:#d32f2f"></span>Matrícula
 <span class="dot" style="background:#f57c00"></span>Teléfono
 <span class="dot" style="background:#7b1fa2"></span>Código postal
-<span class="dot" style="background:#1976d2"></span>Lugar (OCR+OSM)<br>
+<span class="dot" style="background:#1976d2"></span>Lugar (OCR+OSM)
+<span class="dot" style="background:#00838f"></span>Título del vídeo<br>
 <span class="dot" style="background:#2e7d32"></span>Zona estimada del vídeo</div>
 <script>
 const EV = __EVIDENCE__;
 const AREA = __AREA__;
-const COLORS = {matricula:"#d32f2f", telefono:"#f57c00", postal:"#7b1fa2", lugar:"#1976d2"};
+const COLORS = {matricula:"#d32f2f", telefono:"#f57c00", postal:"#7b1fa2",
+                lugar:"#1976d2", titulo:"#00838f"};
 const map = L.map("map");
 L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png",
   {attribution:"&copy; OpenStreetMap"}).addTo(map);
@@ -350,10 +383,13 @@ for (const e of EV) {
   if (e.lat === null) continue;
   const c = L.circleMarker([e.lat, e.lon], {radius:8, color:COLORS[e.type],
     fillColor:COLORS[e.type], fillOpacity:.75});
+  const img = e.frame === "titulo" ? ""
+    : `<a href="frames/${e.frame}" target="_blank"><img src="frames/${e.frame}"></a>`;
+  const when = e.frame === "titulo" ? "título del vídeo"
+    : `min ${e.hhmmss} — <a href="${e.yt}" target="_blank">ver en YouTube</a>`;
   c.bindPopup(`<div class="pop"><b>${e.type}: ${e.match}</b>
     <div class="t">${e.zone ?? ""}</div>
-    <div class="t">min ${e.hhmmss} — <a href="${e.yt}" target="_blank">ver en YouTube</a></div>
-    <a href="frames/${e.frame}" target="_blank"><img src="frames/${e.frame}"></a></div>`);
+    <div class="t">${when}</div>${img}</div>`);
   c.addTo(map);
   bounds.push([e.lat, e.lon]);
 }
@@ -405,8 +441,9 @@ def write_outputs(outdir: Path, meta: dict, evidence: list[dict],
     lines.append("|---|---|---|---|---|")
     for e in sorted(evidence, key=lambda x: x["t"]):
         zone = (e["zone"] or "")[:70]
-        lines.append(f"| {e['hhmmss']} | {e['type']} | {e['match']} | {zone} "
-                     f"| [{e['frame']}](frames/{e['frame']}) · [YouTube]({e['yt']}) |")
+        see = ("título" if e["frame"] == "titulo" else
+               f"[{e['frame']}](frames/{e['frame']}) · [YouTube]({e['yt']})")
+        lines.append(f"| {e['hhmmss']} | {e['type']} | {e['match']} | {zone} | {see} |")
     (outdir / "report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
     print(f"      {outdir / 'map.html'}")
     print(f"      {outdir / 'report.md'}")
@@ -468,7 +505,7 @@ def main() -> None:
         evidence = [{**s, "t": f["t"], "frame": f["frame"]}
                     for f in per_frame for s in f["signals"] if s["lat"] is not None]
     else:
-        evidence = geocode_signals(per_frame, args.max_queries)
+        evidence = geocode_signals(per_frame, title_places(meta), args.max_queries)
 
     area = dominant_area(evidence)
     write_outputs(outdir, meta, evidence, area, len(frames))
