@@ -40,7 +40,7 @@ NOMINATIM = "https://nominatim.openstreetmap.org/search"
 
 # pesos por tipo de pista al decidir la zona dominante
 WEIGHTS = {"matricula": 3.0, "telefono": 3.0, "postal": 4.0, "titulo": 2.5,
-           "mencion": 1.2, "lugar": 1.0}
+           "capitulo": 2.5, "mencion": 1.2, "lugar": 1.0}
 
 
 class TrackError(Exception):
@@ -97,6 +97,9 @@ def download_video(url: str, workdir: Path, log=print) -> tuple[Path, dict]:
         "duration": info.get("duration") or 0,
         "url": info.get("webpage_url", url),
         "uploader": info.get("uploader", ""),
+        "description": info.get("description") or "",
+        "chapters": [{"t": c.get("start_time") or 0, "title": c.get("title", "")}
+                     for c in info.get("chapters") or []],
     }
     print(f"      «{meta['title']}» — {meta['duration']}s")
     return path, meta
@@ -167,12 +170,32 @@ def check_tesseract() -> None:
                 "Instálalo con: brew install tesseract-lang")
 
 
+def _street_crop(image: Path) -> Path | None:
+    """Mitad inferior del fotograma ampliada ×2: ahí están matrículas y
+    carteles a pie de calle, y Tesseract lee mucho mejor el texto grande."""
+    from PIL import Image
+    try:
+        with Image.open(image) as im:
+            w, h = im.size
+            top = int(h * 0.45)
+            crop = im.crop((0, top, w, h)).resize((w * 2, (h - top) * 2),
+                                                  Image.LANCZOS)
+            out = image.with_suffix(".roi.jpg")
+            crop.save(out, quality=90)
+            return out
+    except OSError:
+        return None
+
+
 def ocr_frame(image: Path) -> list[str]:
     """OCR de un fotograma. Devuelve líneas de texto con confianza aceptable."""
+    roi = _street_crop(image)
+    passes = [("full", image, "jpn+eng", "11"), ("vert", image, "jpn_vert", "5")]
+    if roi:
+        passes.append(("roi", roi, "jpn+eng", "11"))
     lines: dict[tuple, list[str]] = {}
-    confs: dict[tuple, list[float]] = {}
-    for lang, psm in (("jpn+eng", "11"), ("jpn_vert", "5")):
-        r = run(["tesseract", str(image), "stdout", "-l", lang,
+    for tag, img, lang, psm in passes:
+        r = run(["tesseract", str(img), "stdout", "-l", lang,
                  "--psm", psm, "tsv"])
         if r.returncode != 0:
             continue
@@ -186,14 +209,16 @@ def ocr_frame(image: Path) -> list[str]:
                 continue
             if conf < 55:
                 continue
-            key = (lang, cols[1], cols[2], cols[3], cols[4])  # page/block/par/line
+            key = (tag, lang, cols[1], cols[2], cols[3], cols[4])  # bloque/línea
             lines.setdefault(key, []).append(cols[11].strip())
-            confs.setdefault(key, []).append(conf)
-    out = []
+    if roi:
+        roi.unlink(missing_ok=True)
+    out, seen = [], set()
     for key, words in lines.items():
-        text = "".join(words) if "jpn" in key[0] else " ".join(words)
+        text = "".join(words) if "jpn" in key[1] else " ".join(words)
         text = unicodedata.normalize("NFKC", text).strip()
-        if len(text) >= 2:
+        if len(text) >= 2 and text not in seen:
+            seen.add(text)
             out.append(text)
     return out
 
@@ -273,6 +298,36 @@ def title_places(meta: dict) -> list[str]:
     return [r for r in runs if not GARBAGE_RE.match(r)][:5]
 
 
+# línea de descripción tipo "12:34 天神橋筋商店街" (con horas opcionales)
+TIMESTAMP_LINE = re.compile(r"^\s*(?:(\d{1,2}):)?(\d{1,2}):(\d{2})\s*[-–—・:]?\s*(.+)$")
+
+
+def chapter_places(meta: dict) -> list[tuple[float, str]]:
+    """Pistas (segundo, topónimo) de los capítulos y la descripción del vídeo.
+
+    Muchos canales de paseos ponen marcas de tiempo con el nombre del sitio;
+    son pistas con minuto exacto y sin coste de OCR.
+    """
+    entries: list[tuple[float, str]] = []
+    for ch in meta.get("chapters") or []:
+        entries.append((float(ch["t"]), ch["title"]))
+    for line in (meta.get("description") or "").splitlines():
+        m = TIMESTAMP_LINE.match(line.strip())
+        if m:
+            hh, mm, ss = int(m.group(1) or 0), int(m.group(2)), int(m.group(3))
+            entries.append((hh * 3600 + mm * 60 + ss, m.group(4)))
+    no_lugares = {"イントロ", "スタート", "オープニング", "エンディング",
+                  "おわり", "まとめ", "ハイライト"}
+    out, seen = [], set()
+    for t, text in entries:
+        for run_ in re.findall(r"[぀-ヿ一-鿿]{3,}", text):
+            if run_ not in seen and run_ not in no_lugares \
+                    and not GARBAGE_RE.match(run_):
+                seen.add(run_)
+                out.append((t, run_))
+    return out[:12]
+
+
 # ---------------------------------------------------------------- geocoding
 
 def nominatim(query: str, extra: dict | None = None) -> dict | None:
@@ -302,8 +357,9 @@ def nominatim(query: str, extra: dict | None = None) -> dict | None:
 
 
 def geocode_signals(per_frame: list[dict], title_cands: list[str],
+                    chapter_cands: list[tuple[float, str]],
                     max_queries: int, log=print) -> list[dict]:
-    """Geocodifica postales, título y nombres candidatos. Devuelve evidencias."""
+    """Geocodifica postales, título, capítulos y candidatos de OCR."""
     evidence = []
     queries_done = 0
 
@@ -329,7 +385,18 @@ def geocode_signals(per_frame: list[dict], title_cands: list[str],
                              "lat": hit["lat"], "lon": hit["lon"], "text": cand,
                              "t": 0.0, "frame": "titulo"})
 
-    # 3) nombres de sitios leídos por OCR: los más repetidos primero.
+    # 3) capítulos / marcas de tiempo de la descripción: sitio + minuto exacto
+    for t, cand in chapter_cands:
+        if queries_done >= max_queries:
+            break
+        hit = nominatim(cand)
+        queries_done += 1
+        if hit and cand in hit["display"]:
+            evidence.append({"type": "capitulo", "match": cand, "zone": hit["display"],
+                             "lat": hit["lat"], "lon": hit["lon"], "text": cand,
+                             "t": float(t), "frame": "capitulo"})
+
+    # 4) nombres de sitios leídos por OCR: los más repetidos primero.
     #    Solo se acepta el resultado si el nombre de OSM CONTIENE el texto leído
     #    (sin esto, Nominatim "encuentra" cualquier basura de OCR en algún pueblo).
     counter: Counter = Counter()
@@ -375,8 +442,11 @@ def dominant_area(evidence: list[dict]) -> dict | None:
         sum(WEIGHTS.get(q["type"], 1) for q in near)
     lon = sum(q["lon"] * WEIGHTS.get(q["type"], 1) for q in near) / \
         sum(WEIGHTS.get(q["type"], 1) for q in near)
+    # la etiqueta sale de la evidencia más fiable del grupo, no de la primera
+    # (un cartel "dirección Nara" no debe dar nombre a un vídeo de Osaka)
+    rep = max(near, key=lambda q: WEIGHTS.get(q["type"], 1))
     return {"lat": lat, "lon": lon, "score": best_score,
-            "n_evidence": len(near), "sample_zone": best.get("zone") or best["match"]}
+            "n_evidence": len(near), "sample_zone": rep.get("zone") or rep["match"]}
 
 
 # ---------------------------------------------------------------- salida
@@ -408,13 +478,15 @@ MAP_TEMPLATE = """<!DOCTYPE html>
 <span class="dot" style="background:#7b1fa2"></span>Código postal
 <span class="dot" style="background:#1976d2"></span>Lugar (OCR+OSM)
 <span class="dot" style="background:#00838f"></span>Título del vídeo
+<span class="dot" style="background:#c2185b"></span>Capítulo
 <span class="dot" style="background:#78909c"></span>Mención<br>
-<span class="dot" style="background:#2e7d32"></span>Zona estimada del vídeo</div>
+<span class="dot" style="background:#2e7d32"></span>Zona estimada · - - recorrido</div>
 <script>
 const EV = __EVIDENCE__;
 const AREA = __AREA__;
 const COLORS = {matricula:"#d32f2f", telefono:"#f57c00", postal:"#7b1fa2",
-                lugar:"#1976d2", titulo:"#00838f", mencion:"#78909c"};
+                lugar:"#1976d2", titulo:"#00838f", capitulo:"#c2185b",
+                mencion:"#78909c"};
 const map = L.map("map");
 L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png",
   {attribution:"&copy; OpenStreetMap"}).addTo(map);
@@ -423,8 +495,9 @@ for (const e of EV) {
   if (e.lat === null) continue;
   const c = L.circleMarker([e.lat, e.lon], {radius:8, color:COLORS[e.type],
     fillColor:COLORS[e.type], fillOpacity:.75});
-  const img = e.frame === "titulo" ? ""
-    : `<a href="frames/${e.frame}" target="_blank"><img src="frames/${e.frame}"></a>`;
+  const hasImg = e.frame && e.frame.startsWith("f_");
+  const img = hasImg
+    ? `<a href="frames/${e.frame}" target="_blank"><img src="frames/${e.frame}"></a>` : "";
   const when = e.frame === "titulo" ? "título del vídeo"
     : `min ${e.hhmmss} — <a href="${e.yt}" target="_blank">ver en YouTube</a>`;
   c.bindPopup(`<div class="pop"><b>${e.type}: ${e.match}</b>
@@ -433,6 +506,12 @@ for (const e of EV) {
   c.addTo(map);
   bounds.push([e.lat, e.lon]);
 }
+// recorrido: pistas con minuto real (no el título), en orden cronológico
+const route = EV.filter(e => e.lat !== null && e.frame !== "titulo")
+                .sort((a,b) => a.t - b.t).map(e => [e.lat, e.lon]);
+if (route.length >= 2)
+  L.polyline(route, {color:"#2e7d32", weight:2.5, opacity:.7,
+                     dashArray:"6 8"}).addTo(map);
 if (AREA) {
   L.circle([AREA.lat, AREA.lon], {radius:30000, color:"#2e7d32", fillOpacity:.08})
     .bindPopup(`<b>Zona estimada</b><br>${AREA.sample_zone}<br>` +
@@ -476,13 +555,25 @@ def write_outputs(outdir: Path, meta: dict, evidence: list[dict],
     else:
         lines += ["## Sin zona estimada",
                   "No se encontraron suficientes pistas geolocalizables.", ""]
+    route = [e for e in sorted(evidence, key=lambda x: x["t"])
+             if e["lat"] is not None and e["frame"] != "titulo"]
+    if len(route) >= 2:
+        lines.append("## Recorrido (zonas por las que pasa)")
+        for e in route:
+            short = ", ".join((e["zone"] or e["match"]).split(", ")[:3])
+            lines.append(f"- **{e['hhmmss']}** — {short}")
+        lines.append("")
     lines.append("## Pistas (orden cronológico)")
     lines.append("| Minuto | Tipo | Pista | Zona | Ver |")
     lines.append("|---|---|---|---|---|")
     for e in sorted(evidence, key=lambda x: x["t"]):
         zone = (e["zone"] or "")[:70]
-        see = ("título" if e["frame"] == "titulo" else
-               f"[{e['frame']}](frames/{e['frame']}) · [YouTube]({e['yt']})")
+        if e["frame"] == "titulo":
+            see = "título"
+        elif str(e["frame"]).startswith("f_"):
+            see = f"[{e['frame']}](frames/{e['frame']}) · [YouTube]({e['yt']})"
+        else:
+            see = f"[YouTube]({e['yt']})"
         lines.append(f"| {e['hhmmss']} | {e['type']} | {e['match']} | {zone} | {see} |")
     (outdir / "report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
     log(f"      {outdir / 'map.html'}")
@@ -538,7 +629,8 @@ def analyze(source: str, frames_budget: int = 24, max_queries: int = 25,
         evidence = [{**s, "t": f["t"], "frame": f["frame"]}
                     for f in per_frame for s in f["signals"] if s["lat"] is not None]
     else:
-        evidence = geocode_signals(per_frame, title_places(meta), max_queries, log)
+        evidence = geocode_signals(per_frame, title_places(meta),
+                                   chapter_places(meta), max_queries, log)
 
     area = dominant_area(evidence)
     write_outputs(outdir, meta, evidence, area, len(frames), log)
