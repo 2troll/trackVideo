@@ -83,3 +83,15 @@ En `output/<id_del_video>/`:
 - Si el vídeo no muestra texto (naturaleza, interiores), no hay magia posible.
 - `output/_downloads/` acumula los vídeos descargados: bórralo cuando ocupe
   mucho.
+
+## App en el teléfono (Android)
+
+La app está instalada como PWA (icono verde "trackVideo"). El servidor del Mac
+arranca solo al encender (LaunchAgent `com.tonyhanma.trackvideo`, log en
+`output/server.log`).
+
+- **Con cable USB**: si la app no carga, ejecuta `./phone.sh` (recrea el túnel
+  `adb reverse`).
+- **Sin cable (misma Wi-Fi)**: conecta el teléfono a la Wi-Fi de casa y usa
+  `http://<IP-del-Mac>:8756`. La primera vez macOS preguntará si permites
+  conexiones entrantes a Python — di que sí.

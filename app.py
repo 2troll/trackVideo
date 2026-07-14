@@ -79,6 +79,10 @@ def past_analyses() -> list[dict]:
 PAGE = """<!DOCTYPE html><html lang="es"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#2e7d32">
+<link rel="manifest" href="/manifest.json">
+<link rel="icon" href="/static/icon-192.png">
+<link rel="apple-touch-icon" href="/static/icon-192.png">
 <title>trackVideo 🗾</title>
 <style>
  body{font-family:system-ui,sans-serif;max-width:640px;margin:0 auto;padding:16px;
@@ -185,6 +189,23 @@ def job_status(job_id):
 @app.get("/out/<path:path>")
 def out_files(path):
     return send_from_directory(OUTPUT, path)
+
+
+@app.get("/manifest.json")
+def manifest():
+    return jsonify({
+        "name": "trackVideo",
+        "short_name": "trackVideo",
+        "description": "¿En qué zona de Japón se grabó este vídeo?",
+        "start_url": "/",
+        "display": "standalone",
+        "background_color": "#fafafa",
+        "theme_color": "#2e7d32",
+        "icons": [
+            {"src": "/static/icon-192.png", "sizes": "192x192", "type": "image/png"},
+            {"src": "/static/icon-512.png", "sizes": "512x512", "type": "image/png"},
+        ],
+    })
 
 
 def lan_ip() -> str:
