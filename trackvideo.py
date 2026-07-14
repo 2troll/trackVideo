@@ -39,12 +39,16 @@ USER_AGENT = "trackVideo/1.0 (hobby project; https://github.com/)"
 NOMINATIM = "https://nominatim.openstreetmap.org/search"
 
 # pesos por tipo de pista al decidir la zona dominante
-WEIGHTS = {"matricula": 3.0, "telefono": 3.0, "postal": 4.0, "titulo": 2.5, "lugar": 1.0}
+WEIGHTS = {"matricula": 3.0, "telefono": 3.0, "postal": 4.0, "titulo": 2.5,
+           "mencion": 1.2, "lugar": 1.0}
+
+
+class TrackError(Exception):
+    """Error de pipeline con mensaje pensado para el usuario."""
 
 
 def die(msg: str) -> None:
-    print(f"[ERROR] {msg}", file=sys.stderr)
-    sys.exit(1)
+    raise TrackError(msg)
 
 
 def run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
@@ -53,14 +57,13 @@ def run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
 
 # ---------------------------------------------------------------- descarga
 
-def download_video(url: str, workdir: Path) -> tuple[Path, dict]:
+def download_video(url: str, workdir: Path, log=print) -> tuple[Path, dict]:
     """Descarga el vídeo con yt-dlp y devuelve (ruta, metadatos)."""
     try:
         import yt_dlp
     except ImportError:
         die("Falta yt-dlp. Ejecuta: ./venv/bin/pip install yt-dlp")
 
-    print(f"[1/5] Descargando vídeo: {url}")
     opts = {
         "format": "bv*[height<=1080][ext=mp4]/bv*[height<=1080]/b[height<=1080]/b",
         "outtmpl": str(workdir / "%(id)s.%(ext)s"),
@@ -68,9 +71,20 @@ def download_video(url: str, workdir: Path) -> tuple[Path, dict]:
         "no_warnings": True,
         "noplaylist": True,
     }
+    # caché: si ya bajamos este vídeo, no volver a molestar a YouTube
+    # (repetir descargas provoca bloqueos 403 temporales)
     with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-    path = Path(ydl.prepare_filename(info))
+        info = ydl.extract_info(url, download=False)
+        cached = [p for p in workdir.glob(f"{info['id']}.*")
+                  if p.suffix != ".part"]
+    if cached:
+        log(f"[1/5] Vídeo ya descargado, usando caché: {cached[0].name}")
+        path = cached[0]
+    else:
+        log(f"[1/5] Descargando vídeo: {url}")
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+        path = Path(ydl.prepare_filename(info))
     if not path.exists():
         # yt-dlp puede haber fusionado a otro contenedor
         candidates = list(workdir.glob(f"{info['id']}.*"))
@@ -99,25 +113,45 @@ def probe_duration(path: Path) -> float:
 
 # ---------------------------------------------------------------- fotogramas
 
-def extract_frames(video: Path, frames_dir: Path, duration: float,
-                   interval: float, max_frames: int) -> list[dict]:
-    """Extrae un fotograma cada `interval` s. Devuelve [{file, t}]."""
-    if duration > 0 and duration / interval > max_frames:
-        interval = duration / max_frames
-        print(f"      Vídeo largo: subo el intervalo a {interval:.1f}s "
-              f"para no pasar de {max_frames} fotogramas.")
+def smart_frames(video: Path, frames_dir: Path, duration: float,
+                 budget: int, log=print) -> list[dict]:
+    """Elige los `budget` fotogramas más nítidos repartidos por todo el vídeo.
+
+    Extrae fotogramas baratos a ~1 fps, divide el vídeo en `budget` tramos y
+    de cada tramo se queda con el de mayor tamaño JPEG: un JPEG más pesado
+    tiene más detalle, o sea menos desenfoque de movimiento. Solo esos pocos
+    pasan al OCR, que es la parte lenta.
+    """
+    base_fps = min(1.0, 600.0 / max(duration, 1.0))  # nunca más de ~600 extraídos
     frames_dir.mkdir(parents=True, exist_ok=True)
-    print(f"[2/5] Extrayendo 1 fotograma cada {interval:.1f}s con ffmpeg…")
+    log(f"[2/5] Buscando los {budget} fotogramas más nítidos "
+        f"(muestreo a {base_fps:.2f} fps)…")
     r = run(["ffmpeg", "-y", "-i", str(video),
-             "-vf", f"fps=1/{interval}", "-q:v", "2",
+             "-vf", f"fps={base_fps}", "-q:v", "3",
              str(frames_dir / "f_%05d.jpg")])
     if r.returncode != 0:
         die(f"ffmpeg falló:\n{r.stderr[-2000:]}")
     frames = sorted(frames_dir.glob("f_*.jpg"))
     if not frames:
         die("ffmpeg no produjo ningún fotograma.")
-    result = [{"file": f, "t": round(i * interval, 1)} for i, f in enumerate(frames)]
-    print(f"      {len(result)} fotogramas extraídos.")
+
+    n = len(frames)
+    if n <= budget:
+        selected = list(range(n))
+    else:
+        selected = []
+        for b in range(budget):
+            lo, hi = b * n // budget, (b + 1) * n // budget
+            if lo >= hi:
+                continue
+            best = max(range(lo, hi), key=lambda i: frames[i].stat().st_size)
+            selected.append(best)
+    keep = {frames[i] for i in selected}
+    for f in frames:  # borrar los descartados para no comer disco
+        if f not in keep:
+            f.unlink()
+    result = [{"file": frames[i], "t": round(i / base_fps, 1)} for i in selected]
+    log(f"      {n} muestreados → {len(result)} nítidos seleccionados para OCR.")
     return result
 
 
@@ -183,7 +217,12 @@ def find_signals(text_lines: list[str]) -> list[dict]:
     for line in text_lines:
         for name, (zone, lat, lon) in PLATE_REGIONS.items():
             if name in line:
-                signals.append({"type": "matricula", "match": name, "zone": zone,
+                # una matrícula real lleva números (ej. 大阪 500 あ 12-34);
+                # sin ellos es solo una mención (tienda "沖縄料理", agencia…).
+                # Los dígitos de un teléfono no cuentan como números de placa.
+                sin_tel = PHONE_RE.sub("", line)
+                kind = "matricula" if re.search(r"\d{2}", sin_tel) else "mencion"
+                signals.append({"type": kind, "match": name, "zone": zone,
                                 "lat": lat, "lon": lon, "text": line})
         for m in PHONE_RE.finditer(line):
             code = m.group(1)
@@ -263,7 +302,7 @@ def nominatim(query: str, extra: dict | None = None) -> dict | None:
 
 
 def geocode_signals(per_frame: list[dict], title_cands: list[str],
-                    max_queries: int) -> list[dict]:
+                    max_queries: int, log=print) -> list[dict]:
     """Geocodifica postales, título y nombres candidatos. Devuelve evidencias."""
     evidence = []
     queries_done = 0
@@ -301,7 +340,7 @@ def geocode_signals(per_frame: list[dict], title_cands: list[str],
             first_seen.setdefault(cand, fr)
     for cand, n in counter.most_common():
         if queries_done >= max_queries:
-            print(f"      Límite de {max_queries} consultas a Nominatim alcanzado.")
+            log(f"      Límite de {max_queries} consultas a Nominatim alcanzado.")
             break
         hit = nominatim(cand)
         queries_done += 1
@@ -368,13 +407,14 @@ MAP_TEMPLATE = """<!DOCTYPE html>
 <span class="dot" style="background:#f57c00"></span>Teléfono
 <span class="dot" style="background:#7b1fa2"></span>Código postal
 <span class="dot" style="background:#1976d2"></span>Lugar (OCR+OSM)
-<span class="dot" style="background:#00838f"></span>Título del vídeo<br>
+<span class="dot" style="background:#00838f"></span>Título del vídeo
+<span class="dot" style="background:#78909c"></span>Mención<br>
 <span class="dot" style="background:#2e7d32"></span>Zona estimada del vídeo</div>
 <script>
 const EV = __EVIDENCE__;
 const AREA = __AREA__;
 const COLORS = {matricula:"#d32f2f", telefono:"#f57c00", postal:"#7b1fa2",
-                lugar:"#1976d2", titulo:"#00838f"};
+                lugar:"#1976d2", titulo:"#00838f", mencion:"#78909c"};
 const map = L.map("map");
 L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png",
   {attribution:"&copy; OpenStreetMap"}).addTo(map);
@@ -406,8 +446,8 @@ else { map.setView([36.2, 138.25], 5); }
 
 
 def write_outputs(outdir: Path, meta: dict, evidence: list[dict],
-                  area: dict | None, n_frames: int) -> None:
-    print("[5/5] Generando mapa e informe…")
+                  area: dict | None, n_frames: int, log=print) -> None:
+    log("[5/5] Generando mapa e informe…")
     vid = meta["id"]
     for e in evidence:
         e["frame"] = e["frame"].name if isinstance(e["frame"], Path) else e["frame"]
@@ -445,48 +485,41 @@ def write_outputs(outdir: Path, meta: dict, evidence: list[dict],
                f"[{e['frame']}](frames/{e['frame']}) · [YouTube]({e['yt']})")
         lines.append(f"| {e['hhmmss']} | {e['type']} | {e['match']} | {zone} | {see} |")
     (outdir / "report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
-    print(f"      {outdir / 'map.html'}")
-    print(f"      {outdir / 'report.md'}")
+    log(f"      {outdir / 'map.html'}")
+    log(f"      {outdir / 'report.md'}")
 
 
-# ---------------------------------------------------------------- main
+# ---------------------------------------------------------------- pipeline
 
-def main() -> None:
-    ap = argparse.ArgumentParser(description="Geolocaliza vídeos de YouTube de Japón por sus pistas visuales.")
-    ap.add_argument("source", help="URL de YouTube o ruta a un vídeo local")
-    ap.add_argument("--interval", type=float, default=4.0, help="segundos entre fotogramas (def. 4)")
-    ap.add_argument("--max-frames", type=int, default=240, help="máximo de fotogramas (def. 240)")
-    ap.add_argument("--max-queries", type=int, default=25, help="máx. consultas a Nominatim (def. 25)")
-    ap.add_argument("--no-geocode", action="store_true", help="no consultar Nominatim (solo matrículas/teléfonos)")
-    ap.add_argument("--keep-video", action="store_true", help="no borrar el vídeo descargado")
-    args = ap.parse_args()
-
+def analyze(source: str, frames_budget: int = 24, max_queries: int = 25,
+            no_geocode: bool = False, keep_video: bool = False,
+            log=print) -> dict:
+    """Pipeline completo. Devuelve {'outdir', 'meta', 'area', 'n_evidence'}."""
     if not shutil.which("ffmpeg"):
         die("Falta ffmpeg. Instálalo con: brew install ffmpeg")
     check_tesseract()
 
     base = Path(__file__).resolve().parent
-    if re.match(r"https?://", args.source):
+    if re.match(r"https?://", source):
         tmp = base / "output" / "_downloads"
         tmp.mkdir(parents=True, exist_ok=True)
-        video, meta = download_video(args.source, tmp)
+        video, meta = download_video(source, tmp, log)
     else:
-        video = Path(args.source)
+        video = Path(source)
         if not video.exists():
             die(f"No existe el fichero {video}")
         meta = {"id": video.stem, "title": video.stem, "duration": 0,
                 "url": str(video), "uploader": ""}
-        print(f"[1/5] Usando vídeo local: {video}")
+        log(f"[1/5] Usando vídeo local: {video}")
 
     meta["duration"] = meta["duration"] or probe_duration(video)
     outdir = base / "output" / meta["id"]
     frames_dir = outdir / "frames"
     if frames_dir.exists():
         shutil.rmtree(frames_dir)
-    frames = extract_frames(video, frames_dir, meta["duration"],
-                            args.interval, args.max_frames)
+    frames = smart_frames(video, frames_dir, meta["duration"], frames_budget, log)
 
-    print(f"[3/5] OCR (jpn + jpn_vert + eng) en {len(frames)} fotogramas…")
+    log(f"[3/5] OCR (jpn + jpn_vert + eng) en {len(frames)} fotogramas…")
     per_frame = []
     for i, fr in enumerate(frames, 1):
         text = ocr_frame(fr["file"])
@@ -495,32 +528,51 @@ def main() -> None:
         if signals or cands:
             per_frame.append({"frame": fr["file"], "t": fr["t"],
                               "signals": signals, "candidates": cands})
-        if i % 20 == 0 or i == len(frames):
-            print(f"      {i}/{len(frames)} — {len(per_frame)} fotogramas con texto útil")
+        if i % 8 == 0 or i == len(frames):
+            log(f"      {i}/{len(frames)} — {len(per_frame)} fotogramas con texto útil")
 
     n_direct = sum(len(f["signals"]) for f in per_frame)
     n_cand = sum(len(f["candidates"]) for f in per_frame)
-    print(f"[4/5] Pistas directas: {n_direct} · candidatos a geocodificar: {n_cand}")
-    if args.no_geocode:
+    log(f"[4/5] Pistas directas: {n_direct} · candidatos a geocodificar: {n_cand}")
+    if no_geocode:
         evidence = [{**s, "t": f["t"], "frame": f["frame"]}
                     for f in per_frame for s in f["signals"] if s["lat"] is not None]
     else:
-        evidence = geocode_signals(per_frame, title_places(meta), args.max_queries)
+        evidence = geocode_signals(per_frame, title_places(meta), max_queries, log)
 
     area = dominant_area(evidence)
-    write_outputs(outdir, meta, evidence, area, len(frames))
+    write_outputs(outdir, meta, evidence, area, len(frames), log)
 
     if area:
-        print(f"\n✅ Zona estimada del vídeo: {area['sample_zone']} "
-              f"({area['lat']:.3f}, {area['lon']:.3f}) — "
-              f"{area['n_evidence']} pistas coincidentes.")
+        log(f"✅ Zona estimada del vídeo: {area['sample_zone']} "
+            f"({area['lat']:.3f}, {area['lon']:.3f}) — "
+            f"{area['n_evidence']} pistas coincidentes.")
     else:
-        print("\n⚠️  No pude estimar la zona: el vídeo no muestra texto geolocalizable "
-              "o el OCR no lo leyó. Prueba con --interval 2 para muestrear más fotogramas.")
-    print(f"Abre el mapa:  open {outdir / 'map.html'}")
+        log("⚠️ No pude estimar la zona: el vídeo no muestra texto geolocalizable "
+            "o el OCR no lo leyó. Prueba a subir el número de fotogramas.")
 
-    if not args.keep_video and video.parent.name == "_downloads":
+    if not keep_video and video.parent.name == "_downloads":
         video.unlink(missing_ok=True)
+    return {"outdir": outdir, "meta": meta, "area": area,
+            "n_evidence": len(evidence)}
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description="Geolocaliza vídeos de YouTube de Japón por sus pistas visuales.")
+    ap.add_argument("source", help="URL de YouTube o ruta a un vídeo local")
+    ap.add_argument("--frames", type=int, default=24,
+                    help="fotogramas nítidos a analizar (def. 24)")
+    ap.add_argument("--max-queries", type=int, default=25, help="máx. consultas a Nominatim (def. 25)")
+    ap.add_argument("--no-geocode", action="store_true", help="no consultar Nominatim (solo matrículas/teléfonos)")
+    ap.add_argument("--keep-video", action="store_true", help="no borrar el vídeo descargado")
+    args = ap.parse_args()
+    try:
+        res = analyze(args.source, args.frames, args.max_queries,
+                      args.no_geocode, args.keep_video)
+    except TrackError as e:
+        print(f"[ERROR] {e}", file=sys.stderr)
+        sys.exit(1)
+    print(f"Abre el mapa:  open {res['outdir'] / 'map.html'}")
 
 
 if __name__ == "__main__":
