@@ -116,19 +116,65 @@ def probe_duration(path: Path) -> float:
 
 # ---------------------------------------------------------------- fotogramas
 
+def _quick_text_score(image: Path) -> int:
+    """Puntuación rápida: ¿cuánto texto legible hay en el fotograma?
+
+    Una sola pasada de tesseract sobre el fotograma; cuenta caracteres con
+    confianza decente. Sirve para elegir entre candidatos, no para leer.
+    """
+    r = run(["tesseract", str(image), "stdout", "-l", "jpn+eng",
+             "--psm", "11", "tsv"])
+    if r.returncode != 0:
+        return 0
+    score = 0
+    for row in r.stdout.splitlines()[1:]:
+        cols = row.split("\t")
+        if len(cols) < 12:
+            continue
+        try:
+            conf = float(cols[10])
+        except ValueError:
+            continue
+        if conf >= 60:
+            score += len(cols[11].strip())
+    return score
+
+
+def _bucket_bounds(n: int, duration: float, base_fps: float,
+                   budget: int) -> list[tuple[int, int]]:
+    """Reparte el presupuesto de fotogramas: más denso al principio.
+
+    Los canales suelen enseñar el entorno (calle, tiendas, coches) en los
+    primeros minutos; el 60% del presupuesto va a los primeros 3 minutos
+    (si el vídeo es largo) y el resto se reparte uniforme.
+    """
+    dense_end_t = min(180.0, duration * 0.5)
+    dense_end = min(n, int(dense_end_t * base_fps))
+    if duration <= 360 or dense_end <= 0:
+        # vídeo corto: reparto uniforme
+        return [(b * n // budget, (b + 1) * n // budget) for b in range(budget)]
+    b1 = max(1, int(budget * 0.6))
+    b2 = budget - b1
+    bounds = [(b * dense_end // b1, (b + 1) * dense_end // b1) for b in range(b1)]
+    rest = n - dense_end
+    bounds += [(dense_end + b * rest // b2, dense_end + (b + 1) * rest // b2)
+               for b in range(b2)]
+    return bounds
+
+
 def smart_frames(video: Path, frames_dir: Path, duration: float,
                  budget: int, log=print) -> list[dict]:
-    """Elige los `budget` fotogramas más nítidos repartidos por todo el vídeo.
+    """Elige los `budget` fotogramas con más texto legible.
 
-    Extrae fotogramas baratos a ~1 fps, divide el vídeo en `budget` tramos y
-    de cada tramo se queda con el de mayor tamaño JPEG: un JPEG más pesado
-    tiene más detalle, o sea menos desenfoque de movimiento. Solo esos pocos
-    pasan al OCR, que es la parte lenta.
+    1. Extrae fotogramas baratos con ffmpeg (denso: ~1 cada 2 s).
+    2. Reparte el presupuesto en tramos, con más peso al principio del vídeo.
+    3. De cada tramo coge los 2 más nítidos (mayor JPEG = menos desenfoque)
+       y se queda con el que MÁS TEXTO contiene según una pasada rápida de
+       OCR — la nitidez sola engaña: la vegetación es nítida pero no dice nada.
     """
-    base_fps = min(1.0, 600.0 / max(duration, 1.0))  # nunca más de ~600 extraídos
+    base_fps = min(0.5, 600.0 / max(duration, 1.0))  # tope ~600 extraídos
     frames_dir.mkdir(parents=True, exist_ok=True)
-    log(f"[2/5] Buscando los {budget} fotogramas más nítidos "
-        f"(muestreo a {base_fps:.2f} fps)…")
+    log(f"[2/5] Extrayendo fotogramas (muestreo a {base_fps:.2f} fps)…")
     r = run(["ffmpeg", "-y", "-i", str(video),
              "-vf", f"fps={base_fps}", "-q:v", "3",
              str(frames_dir / "f_%05d.jpg")])
@@ -142,19 +188,31 @@ def smart_frames(video: Path, frames_dir: Path, duration: float,
     if n <= budget:
         selected = list(range(n))
     else:
+        log(f"      {n} muestreados; eligiendo los {budget} con más texto "
+            f"(esto tarda un poco)…")
         selected = []
-        for b in range(budget):
-            lo, hi = b * n // budget, (b + 1) * n // budget
+        for k, (lo, hi) in enumerate(_bucket_bounds(n, duration, base_fps,
+                                                    budget), 1):
             if lo >= hi:
                 continue
-            best = max(range(lo, hi), key=lambda i: frames[i].stat().st_size)
-            selected.append(best)
+            cands = sorted(range(lo, hi),
+                           key=lambda i: frames[i].stat().st_size,
+                           reverse=True)[:2]
+            if len(cands) == 2:
+                scores = {i: _quick_text_score(frames[i]) for i in cands}
+                # con texto gana el que más tiene; sin texto, el más nítido
+                cands.sort(key=lambda i: (scores[i], frames[i].stat().st_size),
+                           reverse=True)
+            selected.append(cands[0])
+            if k % 12 == 0:
+                log(f"      … {k}/{budget} tramos revisados")
+    selected = sorted(set(selected))
     keep = {frames[i] for i in selected}
     for f in frames:  # borrar los descartados para no comer disco
         if f not in keep:
             f.unlink()
     result = [{"file": frames[i], "t": round(i / base_fps, 1)} for i in selected]
-    log(f"      {n} muestreados → {len(result)} nítidos seleccionados para OCR.")
+    log(f"      {len(result)} fotogramas seleccionados para lectura a fondo.")
     return result
 
 
@@ -170,52 +228,31 @@ def check_tesseract() -> None:
                 "Instálalo con: brew install tesseract-lang")
 
 
-def _street_crop(image: Path) -> Path | None:
-    """Mitad inferior del fotograma ampliada ×2: ahí están matrículas y
-    carteles a pie de calle, y Tesseract lee mucho mejor el texto grande."""
-    from PIL import Image
-    try:
-        with Image.open(image) as im:
-            w, h = im.size
-            top = int(h * 0.45)
-            crop = im.crop((0, top, w, h)).resize((w * 2, (h - top) * 2),
-                                                  Image.LANCZOS)
-            out = image.with_suffix(".roi.jpg")
-            crop.save(out, quality=90)
-            return out
-    except OSError:
-        return None
+_READER = None  # EasyOCR se carga una sola vez (tarda ~25 s la primera)
+
+
+def _reader():
+    global _READER
+    if _READER is None:
+        import easyocr
+        _READER = easyocr.Reader(["ja", "en"], gpu=False, verbose=False)
+    return _READER
 
 
 def ocr_frame(image: Path) -> list[str]:
-    """OCR de un fotograma. Devuelve líneas de texto con confianza aceptable."""
-    roi = _street_crop(image)
-    passes = [("full", image, "jpn+eng", "11"), ("vert", image, "jpn_vert", "5")]
-    if roi:
-        passes.append(("roi", roi, "jpn+eng", "11"))
-    lines: dict[tuple, list[str]] = {}
-    for tag, img, lang, psm in passes:
-        r = run(["tesseract", str(img), "stdout", "-l", lang,
-                 "--psm", psm, "tsv"])
-        if r.returncode != 0:
-            continue
-        for row in r.stdout.splitlines()[1:]:
-            cols = row.split("\t")
-            if len(cols) < 12 or not cols[11].strip():
-                continue
-            try:
-                conf = float(cols[10])
-            except ValueError:
-                continue
-            if conf < 55:
-                continue
-            key = (tag, lang, cols[1], cols[2], cols[3], cols[4])  # bloque/línea
-            lines.setdefault(key, []).append(cols[11].strip())
-    if roi:
-        roi.unlink(missing_ok=True)
+    """OCR de escena con EasyOCR: lee carteles, tiendas y matrículas de calle.
+
+    EasyOCR detecta y lee texto en fotos reales mucho mejor que Tesseract
+    (que es para documentos escaneados). Devuelve las líneas legibles.
+    """
+    try:
+        results = _reader().readtext(str(image), detail=1, paragraph=False)
+    except Exception:  # noqa: BLE001 — un frame ilegible no debe parar el lote
+        return []
     out, seen = [], set()
-    for key, words in lines.items():
-        text = "".join(words) if "jpn" in key[1] else " ".join(words)
+    for _box, text, conf in results:
+        if conf < 0.35:
+            continue
         text = unicodedata.normalize("NFKC", text).strip()
         if len(text) >= 2 and text not in seen:
             seen.add(text)
@@ -231,9 +268,12 @@ POSTAL_RE = re.compile(r"〒?\s*(\d{3})[-‐−ー](\d{4})")
 # sufijos que suelen indicar un topónimo real
 PLACE_SUFFIX = re.compile(r"(駅|通り|通|商店街|市場|温泉|神社|寺|城|公園|橋|港|空港)$")
 
-# ruido típico del OCR que no aporta nada
+# ruido típico del OCR que no aporta nada: texto genérico de carteles y
+# marcas nacionales de vallas publicitarias (geocodifican a su sede, no al sitio)
 STOPWORDS = {"営業中", "駐車場", "禁煙", "無料", "有料", "案内", "注意", "出口", "入口",
-             "本日", "年中無休", "終日", "電話", "受付", "募集", "テナント"}
+             "本日", "年中無休", "終日", "電話", "受付", "募集", "テナント",
+             "入口専用", "出口専用", "駐車禁止", "立入禁止", "営業時間", "準備中",
+             "龍角散", "サロンパス", "楽天", "ドコモ", "ソフトバンク"}
 
 
 def find_signals(text_lines: list[str]) -> list[dict]:
@@ -459,67 +499,134 @@ def hhmmss(t: float) -> str:
 MAP_TEMPLATE = """<!DOCTYPE html>
 <html lang="es"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#2e7d32">
 <title>trackVideo — __TITLE__</title>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <style>
   html,body{margin:0;height:100%;font-family:system-ui,sans-serif}
-  #map{height:100%}
-  .lg{position:absolute;z-index:1000;bottom:12px;left:12px;background:#fffd;
-      padding:8px 12px;border-radius:8px;font-size:13px;line-height:1.7}
-  .dot{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:5px}
-  .pop img{max-width:280px;border-radius:6px;display:block;margin-top:6px}
+  #wrap{display:flex;flex-direction:column;height:100%}
+  header{background:#2e7d32;color:#fff;padding:10px 14px;z-index:1200;
+         box-shadow:0 1px 6px #0004}
+  header .row{display:flex;align-items:center;gap:10px}
+  header a.back{color:#fff;text-decoration:none;font-size:24px;line-height:1}
+  header .tt{font-weight:600;font-size:15px;white-space:nowrap;overflow:hidden;
+             text-overflow:ellipsis;flex:1}
+  .chip{display:inline-block;background:#fff2;border:1px solid #fff5;
+        border-radius:99px;padding:3px 12px;font-size:13px;margin-top:6px;
+        max-width:100%;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  #map{flex:1}
+  #cards{position:absolute;bottom:0;left:0;right:0;z-index:1100;
+         display:flex;gap:10px;overflow-x:auto;padding:10px 12px;
+         -webkit-overflow-scrolling:touch;scroll-snap-type:x mandatory}
+  .card{scroll-snap-align:start;flex:0 0 220px;background:#fff;border-radius:14px;
+        box-shadow:0 2px 10px #0003;overflow:hidden;cursor:pointer}
+  .card img{width:100%;height:110px;object-fit:cover;display:block;background:#eee}
+  .card .noimg{width:100%;height:110px;display:flex;align-items:center;
+        justify-content:center;font-size:40px;background:#e8f5e9}
+  .card .b{padding:8px 10px 10px}
+  .card .ty{display:inline-block;color:#fff;border-radius:99px;padding:1px 9px;
+        font-size:11px;font-weight:600;margin-bottom:4px}
+  .card .m{font-weight:600;font-size:14px}
+  .card .z{font-size:11.5px;color:#666;height:2.6em;overflow:hidden}
+  .card .t{font-size:12px;color:#2e7d32;font-weight:600;margin-top:3px}
+  .pop img{max-width:260px;border-radius:8px;display:block;margin-top:6px}
   .pop .t{font-size:12px;color:#555}
+  .empty{position:absolute;inset:0;display:flex;align-items:center;
+        justify-content:center;z-index:1100;pointer-events:none}
+  .empty>div{background:#fffe;border-radius:14px;padding:18px 22px;max-width:340px;
+        text-align:center;box-shadow:0 2px 12px #0003;pointer-events:auto}
 </style></head><body>
-<div id="map"></div>
-<div class="lg"><b>__TITLE__</b><br>
-<span class="dot" style="background:#d32f2f"></span>Matrícula
-<span class="dot" style="background:#f57c00"></span>Teléfono
-<span class="dot" style="background:#7b1fa2"></span>Código postal
-<span class="dot" style="background:#1976d2"></span>Lugar (OCR+OSM)
-<span class="dot" style="background:#00838f"></span>Título del vídeo
-<span class="dot" style="background:#c2185b"></span>Capítulo
-<span class="dot" style="background:#78909c"></span>Mención<br>
-<span class="dot" style="background:#2e7d32"></span>Zona estimada · - - recorrido</div>
+<div id="wrap">
+<header>
+  <div class="row"><a class="back" href="/">‹</a><div class="tt">__TITLE__</div></div>
+  <div id="zone"></div>
+</header>
+<div id="map" style="position:relative"></div>
+</div>
 <script>
 const EV = __EVIDENCE__;
 const AREA = __AREA__;
 const COLORS = {matricula:"#d32f2f", telefono:"#f57c00", postal:"#7b1fa2",
                 lugar:"#1976d2", titulo:"#00838f", capitulo:"#c2185b",
                 mencion:"#78909c"};
-const map = L.map("map");
+const NAMES = {matricula:"Matrícula", telefono:"Teléfono", postal:"C. postal",
+               lugar:"Lugar", titulo:"Título", capitulo:"Capítulo",
+               mencion:"Mención"};
+const zoneEl = document.getElementById("zone");
+if (AREA) {
+  const short = AREA.sample_zone.split(", ").slice(0,4).join(", ");
+  zoneEl.innerHTML = `<span class="chip">📍 ${short}</span>`;
+} else {
+  zoneEl.innerHTML = `<span class="chip">Sin zona clara — mira las pistas</span>`;
+}
+const map = L.map("map", {zoomControl:false});
+L.control.zoom({position:"topright"}).addTo(map);
 L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png",
   {attribution:"&copy; OpenStreetMap"}).addTo(map);
-const bounds = [];
-for (const e of EV) {
-  if (e.lat === null) continue;
-  const c = L.circleMarker([e.lat, e.lon], {radius:8, color:COLORS[e.type],
-    fillColor:COLORS[e.type], fillOpacity:.75});
+const located = EV.filter(e => e.lat !== null);
+const bounds = [], markers = [];
+for (const e of located) {
+  const c = L.circleMarker([e.lat, e.lon], {radius:9, weight:2.5, color:"#fff",
+    fillColor:COLORS[e.type], fillOpacity:.95});
   const hasImg = e.frame && e.frame.startsWith("f_");
   const img = hasImg
     ? `<a href="frames/${e.frame}" target="_blank"><img src="frames/${e.frame}"></a>` : "";
   const when = e.frame === "titulo" ? "título del vídeo"
-    : `min ${e.hhmmss} — <a href="${e.yt}" target="_blank">ver en YouTube</a>`;
-  c.bindPopup(`<div class="pop"><b>${e.type}: ${e.match}</b>
+    : `min ${e.hhmmss} — <a href="${e.yt}" target="_blank">ver en YouTube ▶</a>`;
+  c.bindPopup(`<div class="pop"><b>${NAMES[e.type]}: ${e.match}</b>
     <div class="t">${e.zone ?? ""}</div>
     <div class="t">${when}</div>${img}</div>`);
   c.addTo(map);
+  markers.push(c);
   bounds.push([e.lat, e.lon]);
 }
-// recorrido: pistas con minuto real (no el título), en orden cronológico
-const route = EV.filter(e => e.lat !== null && e.frame !== "titulo")
-                .sort((a,b) => a.t - b.t).map(e => [e.lat, e.lon]);
+const route = located.filter(e => e.frame !== "titulo")
+                     .sort((a,b) => a.t - b.t).map(e => [e.lat, e.lon]);
 if (route.length >= 2)
   L.polyline(route, {color:"#2e7d32", weight:2.5, opacity:.7,
                      dashArray:"6 8"}).addTo(map);
 if (AREA) {
   L.circle([AREA.lat, AREA.lon], {radius:30000, color:"#2e7d32", fillOpacity:.08})
-    .bindPopup(`<b>Zona estimada</b><br>${AREA.sample_zone}<br>` +
-               `${AREA.n_evidence} pistas coincidentes`).addTo(map);
+    .addTo(map);
   bounds.push([AREA.lat, AREA.lon]);
 }
 if (bounds.length) map.fitBounds(bounds, {padding:[40,40], maxZoom: 14});
-else { map.setView([36.2, 138.25], 5); }
+else map.setView([36.2, 138.25], 5);
+
+// tarjetas táctiles: toca una y el mapa vuela a su punto
+if (located.length) {
+  const cards = document.createElement("div");
+  cards.id = "cards";
+  located.sort((a,b) => a.t - b.t).forEach((e, i) => {
+    const hasImg = e.frame && e.frame.startsWith("f_");
+    const media = hasImg ? `<img loading="lazy" src="frames/${e.frame}">`
+                         : `<div class="noimg">${e.type==="capitulo"?"🔖":"🎬"}</div>`;
+    const when = e.frame === "titulo" ? "del título" : "min " + e.hhmmss;
+    const d = document.createElement("div");
+    d.className = "card";
+    d.innerHTML = `${media}<div class="b">
+      <span class="ty" style="background:${COLORS[e.type]}">${NAMES[e.type]}</span>
+      <div class="m">${e.match}</div>
+      <div class="z">${(e.zone ?? "").split(", ").slice(0,4).join(", ")}</div>
+      <div class="t">${when}</div></div>`;
+    d.onclick = () => {
+      const k = located.indexOf(e);
+      map.flyTo([e.lat, e.lon], Math.max(map.getZoom(), 14));
+      markers[k].openPopup();
+    };
+    cards.appendChild(d);
+  });
+  document.getElementById("map").appendChild(cards);
+} else {
+  const d = document.createElement("div");
+  d.className = "empty";
+  d.innerHTML = `<div><b>Sin pistas geolocalizables 😔</b><br>
+    <span style="font-size:13.5px;color:#555">El vídeo no muestra carteles,
+    matrículas ni nombres legibles. Prueba el modo «a fondo» o con un vídeo
+    de paseo por calles.</span></div>`;
+  document.getElementById("map").appendChild(d);
+}
 </script></body></html>
 """
 
@@ -610,7 +717,8 @@ def analyze(source: str, frames_budget: int = 24, max_queries: int = 25,
         shutil.rmtree(frames_dir)
     frames = smart_frames(video, frames_dir, meta["duration"], frames_budget, log)
 
-    log(f"[3/5] OCR (jpn + jpn_vert + eng) en {len(frames)} fotogramas…")
+    log(f"[3/5] Leyendo carteles y matrículas (EasyOCR) en {len(frames)} "
+        f"fotogramas…")
     per_frame = []
     for i, fr in enumerate(frames, 1):
         text = ocr_frame(fr["file"])
